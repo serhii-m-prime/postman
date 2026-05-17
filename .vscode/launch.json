@@ -1,0 +1,20 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug Postman (RPi5)",
+            "program": "${workspaceFolder}/target/debug/postman",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "cargo build debug",
+            "env": {
+                "PATH": "/home/graycat/.cargo/bin:${env:PATH}"
+            },
+            "sourceLanguages": [
+                "rust"
+            ]
+        }
+    ]
+}

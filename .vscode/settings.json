@@ -1,0 +1,6 @@
+{
+    "terminal.integrated.env.linux": {
+        "PATH": "/home/graycat/.cargo/bin:${env:PATH}"
+    },
+    "lldb.cargoPath": "/home/graycat/.cargo/bin/cargo"
+}
