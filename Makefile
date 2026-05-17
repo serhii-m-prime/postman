@@ -61,3 +61,7 @@ clean:
 clean-db:
 	rm -rf data/*
 	@echo "Data directory cleaned."
+
+clean-logs:
+	rm -rf logs/*
+	@echo "Logs directory cleaned."
