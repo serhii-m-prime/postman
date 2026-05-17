@@ -2,6 +2,13 @@ use crate::AppContext;
 use rusqlite::{Connection, Result};
 use tracing::{info};
 
+pub struct RawArticle {
+    pub id: i32,
+    pub feed_name: String,
+    pub title: String,
+    pub description: Option<String>,
+}
+
 pub fn get_connection(db_path: &str) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -114,6 +121,50 @@ pub fn update_feed_state(ctx: &AppContext, feed_name: &str, last_hash: &str) -> 
             last_checked_at = CURRENT_TIMESTAMP,
             last_item_hash = EXCLUDED.last_item_hash",
         rusqlite::params![feed_name, last_hash],
+    )?;
+    Ok(())
+}
+
+pub fn get_unprocessed_articles(ctx: &AppContext) -> Result<Vec<RawArticle>> {
+    let conn = &ctx.db;
+    let mut stmt = conn.prepare(
+        "SELECT id, feed_name, title, description 
+         FROM articles 
+         WHERE event_slug IS NULL 
+         ORDER BY id ASC"
+    )?;
+
+    let article_iter = stmt.query_map([], |row| {
+        Ok(RawArticle {
+            id: row.get(0)?,
+            feed_name: row.get(1)?,
+            title: row.get(2)?,
+            description: row.get(3)?,
+        })
+    })?;
+
+    let mut articles = Vec::new();
+    for article in article_iter {
+        articles.push(article?);
+    }
+
+    Ok(articles)
+}
+
+pub fn update_processed_article(
+    ctx: &AppContext,
+    id: i32,
+    score: i32,
+    category: &str,
+    event_slug: &str,
+    reason: &str,
+) -> rusqlite::Result<()> {
+    let conn = &ctx.db;
+    conn.execute(
+        "UPDATE articles 
+         SET score = ?, category = ?, summary = ?, event_slug = ?, is_sent = 0 
+         WHERE id = ?",
+        rusqlite::params![score, category, reason, event_slug,  id],
     )?;
     Ok(())
 }

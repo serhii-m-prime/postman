@@ -37,7 +37,7 @@ enum Commands {
         #[arg(long = "debug")]
         is_debug: bool,
         #[arg(long)]
-        article_id: Option<u64>,
+        article_id: Option<i32>,
     },
     /// Publish digest in Telegram
     Publish {
