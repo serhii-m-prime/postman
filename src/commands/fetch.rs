@@ -1,11 +1,16 @@
-use crate::config::Config;
+use crate::AppContext;
 use tracing::{info, debug};
 
-pub async fn run(config: &Config, debug_mode: bool, feed_id: Option<String>) {
+pub async fn run(ctx: &AppContext, feed_id: Option<String>) {
     info!("Starting FETCH process...");
-    if debug_mode {
-        debug!("[DEBUG] Feed filter: {:?} CONFIG: {:?}", feed_id, config);
+    if ctx.is_debug {
+        debug!("[DEBUG] Feed filter: {:?} CONFIG: {:?}", feed_id, ctx.config);
     }
 
     info!("FETCH process completed.");
+}
+
+fn calculate_hash(text: &str) -> String {
+    let digest = md5::compute(text.as_bytes());
+    format!("{:x}", digest)
 }

@@ -3,6 +3,7 @@ use std::fs;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    pub mysqlite_path: String,
     pub feeds: Vec<FeedConfig>,
     pub prompts: Prompts,
     pub filters: Filters,

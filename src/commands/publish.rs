@@ -1,9 +1,9 @@
-use crate::config::Config;
+use crate::AppContext;
 use tracing::{info, debug};
 
-pub async fn run(config: &Config, debug_mode: bool, category: String,) {
+pub async fn run(ctx: &AppContext, category: String,) {
     info!("Starting PUBLISH process...");
-    if debug_mode {
+    if ctx.is_debug {
         debug!("[DEBUG] Category: {:?}", category);
     }
     

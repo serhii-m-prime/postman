@@ -1,7 +1,10 @@
 mod config;
 mod commands;
+mod db;
 
 use clap::{Parser, Subcommand};
+use rusqlite::Connection;
+use crate::config::Config;
 use tracing::{error, info, Level};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::layer::SubscriberExt;
@@ -12,6 +15,12 @@ use tracing_subscriber::util::SubscriberInitExt;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+pub struct AppContext {
+    pub config: Config,
+    pub db: Connection,
+    pub is_debug: bool,
 }
 
 #[derive(Subcommand)]
@@ -70,7 +79,17 @@ fn init_logger() {
 #[tokio::main]
 async fn main() {
     init_logger();
-    info!("News Agent initializing...");
+    info!("Postman initializing...");
+
+    let cli = Cli::parse();
+
+    let is_debug = match &cli.command {
+        Commands::Fetch { is_debug, .. } => *is_debug,
+        Commands::Process { is_debug, .. } => *is_debug,
+        Commands::Publish { is_debug, .. } => *is_debug,
+        Commands::Stats { is_debug, .. } => *is_debug,
+        Commands::Install => false,
+    };
 
     let config = match config::Config::load("config.yaml") {
         Ok(c) => c,
@@ -80,28 +99,42 @@ async fn main() {
         }
     };
 
-    let cli = Cli::parse();
+// Initialize SQLite Database
+    let db_conn = match db::get_connection(&config.mysqlite_path) {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("Failed to initialize database: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let ctx = AppContext {
+                config,
+                db: db_conn,
+                is_debug,
+    };
+    
 
     match cli.command {
-        Commands::Fetch { is_debug, data_feed } => {
-            info!("Fetch task triggered. Debug: {}, Data feed: {:?}", is_debug, data_feed);
-            commands::fetch::run(&config, is_debug, data_feed).await;
+        Commands::Fetch { data_feed, .. } => {
+            info!("Fetch task triggered. Debug: {}, Data feed: {:?}", ctx.is_debug, data_feed);
+            commands::fetch::run(&ctx, data_feed).await;
         }
-        Commands::Process { is_debug, article_id } => {
-            info!("Process task triggered. Debug: {}, Article ID: {:?}", is_debug, article_id);
-            commands::process::run(&config, is_debug, article_id).await;
+        Commands::Process { article_id, .. } => {
+            info!("Process task triggered. Debug: {}, Article ID: {:?}", ctx.is_debug, article_id);
+            commands::process::run(&ctx, article_id).await;
         }
-        Commands::Publish { is_debug, category } => {
-            info!("Publish task triggered. Debug: {}, Category: {}", is_debug, category);
-            commands::publish::run(&config, is_debug, category).await;
+        Commands::Publish { category, .. } => {
+            info!("Publish task triggered. Debug: {}, Category: {}", ctx.is_debug, category);
+            commands::publish::run(&ctx, category).await;
         }
-        Commands::Stats { is_debug, period } => {
-            info!("Stats task triggered. Debug: {}, Period: {}", is_debug, period);
-            commands::stats::run(&config, is_debug, period).await;
+        Commands::Stats { period, .. } => {
+            info!("Stats task triggered. Debug: {}, Period: {}", ctx.is_debug, period);
+            commands::stats::run(&ctx, period).await;
         }
         Commands::Install => {
             info!("Install task triggered.");
-            commands::install::run(&config).await;
+            commands::install::run(&ctx).await;
         }
     }
 }

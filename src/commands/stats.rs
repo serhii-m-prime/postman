@@ -1,11 +1,11 @@
-use crate::config::Config;
+use crate::AppContext;
 use tracing::{info, debug};
 
-pub async fn run(config: &Config, debug_mode: bool, period: String,) {
+pub async fn run(ctx: &AppContext, period: String,) {
     info!("Starting STATS process...");
-    if debug_mode {
+    if ctx.is_debug {
         debug!("[DEBUG] Period: {:?}", period);
     }
-    // TODO: Обхід RSS
+    // TODO: Implement RSS feed processing
     info!("STATS process completed.");
 }

@@ -1,9 +1,9 @@
-use crate::config::Config;
+use crate::AppContext;
 use tracing::{info, debug};
 
-pub async fn run(config: &Config, debug_mode: bool, article_id: Option<u64>) {
+pub async fn run(ctx: &AppContext, article_id: Option<u64>) {
     info!("Starting processing...");
-    if debug_mode {
+    if ctx.is_debug {
         debug!("[DEBUG] article id: {:?}", article_id);
     }
     

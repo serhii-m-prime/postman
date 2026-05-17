@@ -1,3 +1,4 @@
+mysqlite_path: "data/db_name.db"
 feeds:
   - name: "hackaday"
     url: "https://hackaday.com/blog/feed/"
