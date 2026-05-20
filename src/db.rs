@@ -9,6 +9,14 @@ pub struct RawArticle {
     pub description: Option<String>,
 }
 
+pub struct PublishableArticle {
+    pub id: i32,
+    pub title: String,
+    pub link: String,
+    pub event_slug: String,
+    pub score: i32,
+}
+
 pub fn get_connection(db_path: &str) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -167,4 +175,57 @@ pub fn update_processed_article(
         rusqlite::params![score, category, reason, event_slug,  id],
     )?;
     Ok(())
+}
+
+pub fn get_best_unpublished_articles(
+    ctx: &AppContext, 
+    target_category: &str
+) -> Result<Vec<PublishableArticle>> {
+    let conn = &ctx.db;
+    
+    // SQL Query logic:
+    // 1. Filter out already processed (is_sent or is_published)
+    // 2. Ensure AI has processed them (event_slug and score are NOT NULL)
+    // 3. Filter by category OR ignore category if 'general' is requested
+    // 4. Use ROW_NUMBER to partition by event_slug and sort by score DESC
+    // 5. Select only rn = 1 (the highest scored article per event)
+    let query = "
+        SELECT id, title, link, event_slug, score 
+        FROM (
+            SELECT id, title, link, event_slug, score,
+                   ROW_NUMBER() OVER(
+                       PARTITION BY event_slug 
+                       ORDER BY score DESC, pub_date DESC
+                   ) as rn
+            FROM articles
+            WHERE is_published = 0 
+              AND is_sent = 0 
+              AND event_slug IS NOT NULL 
+              AND score IS NOT NULL
+              AND (category = ?1 OR ?1 = 'general')
+        ) 
+        WHERE rn = 1
+        ORDER BY score DESC
+        LIMIT ?2
+    ";
+    
+    let mut stmt = conn.prepare(query)?;
+    
+    // Map the database row to our struct
+    let article_iter = stmt.query_map([target_category, &ctx.config.articles_in_post], |row| {
+        Ok(PublishableArticle {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            link: row.get(2)?,
+            event_slug: row.get(3)?,
+            score: row.get(4)?,
+        })
+    })?;
+
+    let mut articles = Vec::new();
+    for article in article_iter {
+        articles.push(article?);
+    }
+
+    Ok(articles)
 }

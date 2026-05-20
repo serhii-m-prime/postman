@@ -1,10 +1,7 @@
 mysqlite_path: "data/db_name.db"
 gemini_api_key: "key"
 gemini_api_url: "https://..."
-feeds:
-  - name: "hackaday"
-    url: "https://hackaday.com/blog/feed/"
-    poll_interval_min: 60
+articles_in_post: 3
 
 prompts:
   scoring: "You are a strict technical expert. Score the news from 1 to 10..."
@@ -19,3 +16,8 @@ telegram:
   bot_token: "YOUR_TELEGRAM_BOT_TOKEN_HERE"
   main_channel_id: "-1000000000000"
   debug_channel_id: "-1000000000001"
+
+feeds:
+  - name: "hackaday"
+    url: "https://hackaday.com/blog/feed/"
+    poll_interval_min: 60

@@ -1,0 +1,859 @@
+=== FILE: ./Makefile ===
+.PHONY: build release install fetch process publish stats clean clean-db reset db
+
+# Якщо під час виклику make передано DEBUG=1, підставляємо --debug, інакше залишаємо пусто
+DEBUG_FLAG = $(if $(DEBUG),--debug,)
+
+# Default target
+all: build
+
+# 1. Compilation
+build:
+	cargo build
+
+release:
+	cargo build --release
+
+# 2. Infrastructure
+install:
+	cargo run -- install
+
+# 3. Workers (Runtime commands)
+# Usage: make fetch | make fetch FEED=techcrunch | make fetch DEBUG=1
+fetch:
+	@if [ "$(FEED)" ]; then \
+		cargo run -- fetch $(DEBUG_FLAG) --data-feed=$(FEED); \
+	else \
+		cargo run -- fetch $(DEBUG_FLAG); \
+	fi
+
+# Usage: make process | make process DEBUG=1
+process:
+	cargo run -- process $(DEBUG_FLAG)
+
+# Usage: make publish | make publish CAT=drones | make publish DEBUG=1
+publish:
+	@if [ "$(CAT)" ]; then \
+		cargo run -- publish $(DEBUG_FLAG) --category=$(CAT); \
+	else \
+		cargo run -- publish $(DEBUG_FLAG) --category=general; \
+	fi
+
+stats:
+	cargo run -- stats $(DEBUG_FLAG)
+
+# 4. Utilities
+reset: clean-db install
+
+# Шукаємо будь-який .db файл у папці data і відкриваємо його
+db:
+	@DB_PATH=$$(ls data/*.db 2>/dev/null | head -n 1); \
+	if [ -z "$$DB_PATH" ]; then \
+		echo "Database file not found in data/ directory."; \
+	else \
+		echo "Opening $$DB_PATH..."; \
+		sqlite3 $$DB_PATH; \
+	fi
+
+clean:
+	cargo clean
+
+# Радикальне очищення всієї згенерованої дати (БД, кеші, логи, якщо вони там)
+clean-db:
+	rm -rf data/*
+	@echo "Data directory cleaned."
+
+clean-logs:
+	rm -rf logs/*
+	@echo "Logs directory cleaned."
+
+
+=== FILE: ./config.example.yaml ===
+mysqlite_path: "data/db_name.db"
+gemini_api_key: "key"
+gemini_api_url: "https://..."
+feeds:
+  - name: "hackaday"
+    url: "https://hackaday.com/blog/feed/"
+    poll_interval_min: 60
+
+prompts:
+  scoring: "You are a strict technical expert. Score the news from 1 to 10..."
+  enrichment: "Summarize this article in 3-4 sentences in Ukrainian..."
+
+filters:
+  blacklist:
+    - datafeed: "hackaday"
+      categories: ["other", "politics"]
+
+telegram:
+  bot_token: "YOUR_TELEGRAM_BOT_TOKEN_HERE"
+  main_channel_id: "-1000000000000"
+  debug_channel_id: "-1000000000001"
+
+
+=== FILE: ./src/main.rs ===
+mod config;
+mod commands;
+mod db;
+
+use clap::{Parser, Subcommand};
+use rusqlite::Connection;
+use crate::config::Config;
+use tracing::{error, info, Level};
+use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+#[derive(Parser)]
+#[command(name = "postman", version = "1.0", about = "AI News pipeline with Optimization by LLMs")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+pub struct AppContext {
+    pub config: Config,
+    pub db: Connection,
+    pub is_debug: bool,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Handle RSS/Atom feeds and stroe them in the database
+    Fetch {
+        #[arg(long = "debug")]
+        is_debug: bool,
+        #[arg(long)]
+        data_feed: Option<String>,
+    },
+    /// Process news queue through Gemini API
+    Process {
+        #[arg(long = "debug")]
+        is_debug: bool,
+        #[arg(long)]
+        article_id: Option<i32>,
+    },
+    /// Publish digest in Telegram
+    Publish {
+        #[arg(long = "debug")]
+        is_debug: bool,
+        #[arg(long)]
+        category: String,
+    },
+    /// Generate analytics for sources
+    Stats {
+        #[arg(long = "debug")]
+        is_debug: bool,
+        #[arg(long, default_value = "7")]
+        period: String,
+    },
+    /// Install systemd timers
+    Install,
+}
+
+fn init_logger() {
+    // Logger: create files app.log.YYYY-MM-DD in dir logs/, save 3 days (TODO: move variable to config)
+    let file_appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .max_log_files(3)
+        .filename_prefix("app.log")
+        .build("logs")
+        .expect("Failed to create file appender");
+
+    // Logger: format for console (without colors, to avoid clutter in systemd)
+    let stdout = std::io::stdout.with_max_level(Level::DEBUG);
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new("info,postman=debug"))
+        .with(tracing_subscriber::fmt::layer().with_writer(stdout))
+        .with(tracing_subscriber::fmt::layer().with_writer(file_appender).with_ansi(false))
+        .init();
+}
+
+#[tokio::main]
+async fn main() {
+    init_logger();
+    info!("Postman initializing...");
+
+    let cli = Cli::parse();
+
+    let is_debug = match &cli.command {
+        Commands::Fetch { is_debug, .. } => *is_debug,
+        Commands::Process { is_debug, .. } => *is_debug,
+        Commands::Publish { is_debug, .. } => *is_debug,
+        Commands::Stats { is_debug, .. } => *is_debug,
+        Commands::Install => false,
+    };
+
+    let config = match config::Config::load("config.yaml") {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to load config.yaml: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+// Initialize SQLite Database
+    let db_conn = match db::get_connection(&config.mysqlite_path) {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("Failed to initialize database: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let ctx = AppContext {
+                config,
+                db: db_conn,
+                is_debug,
+    };
+    
+
+    match cli.command {
+        Commands::Fetch { data_feed, .. } => {
+            info!("Fetch task triggered. Debug: {}, Data feed: {:?}", ctx.is_debug, data_feed);
+            commands::fetch::run(&ctx, data_feed).await;
+        }
+        Commands::Process { article_id, .. } => {
+            info!("Process task triggered. Debug: {}, Article ID: {:?}", ctx.is_debug, article_id);
+            commands::process::run(&ctx, article_id).await;
+        }
+        Commands::Publish { category, .. } => {
+            info!("Publish task triggered. Debug: {}, Category: {}", ctx.is_debug, category);
+            commands::publish::run(&ctx, category).await;
+        }
+        Commands::Stats { period, .. } => {
+            info!("Stats task triggered. Debug: {}, Period: {}", ctx.is_debug, period);
+            commands::stats::run(&ctx, period).await;
+        }
+        Commands::Install => {
+            info!("Install task triggered.");
+            commands::install::run(&ctx).await;
+        }
+    }
+}
+
+
+=== FILE: ./src/config.rs ===
+use serde::Deserialize;
+use std::fs;
+
+#[derive(Debug, Deserialize)]
+pub struct Config {
+    pub mysqlite_path: String,
+    pub gemini_api_key: String,
+    pub gemini_api_url: String,
+    pub feeds: Vec<FeedConfig>,
+    pub prompts: Prompts,
+    pub filters: Filters,
+    pub telegram: TelegramConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FeedConfig {
+    pub name: String,
+    pub url: String,
+    pub poll_interval_min: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Prompts {
+    pub scoring: String,
+    pub enrichment: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Filters {
+    pub blacklist: Vec<BlacklistRule>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BlacklistRule {
+    pub datafeed: String,
+    pub categories: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TelegramConfig {
+    pub bot_token: String,
+    pub main_channel_id: String,
+    pub debug_channel_id: String,
+}
+
+impl Config {
+    pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let content = fs::read_to_string(path)?;
+        let config: Config = serde_yaml::from_str(&content)?;
+        Ok(config)
+    }
+}
+
+
+=== FILE: ./src/commands/fetch.rs ===
+// src/commands/fetch.rs
+
+use crate::AppContext;
+use crate::db;
+use tracing::{info, error, warn, debug};
+use wreq::Client;
+use wreq_util::Emulation;
+
+pub async fn run(ctx: &AppContext, target_feed: Option<String>) {
+    info!("Starting FETCH process with modern browser emulation (wreq)...");
+
+    let feeds_to_process: Vec<_> = match &target_feed {
+        Some(name) => ctx.config.feeds.iter().filter(|f| &f.name == name).collect(),
+        None => ctx.config.feeds.iter().collect(),
+    };
+
+    if feeds_to_process.is_empty() {
+        warn!("No matching feeds found in config for target: {:?}", target_feed);
+        return;
+    }
+
+    let client = match Client::builder()
+        .emulation(Emulation::Chrome137)
+        .redirect(wreq::redirect::Policy::limited(5))
+        .timeout(std::time::Duration::from_secs(15))
+        .build() 
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to build wreq emulation client: {}", e);
+            return;
+        }
+    };
+
+    // 3. Обхід джерела
+    for feed in feeds_to_process {
+        info!("Fetching feed: {} ({})", feed.name, feed.url);
+        
+        match client.get(&feed.url).send().await {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    error!("HTTP error {} for feed {}", response.status(), feed.name);
+                    continue;
+                }
+
+                let bytes = match response.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!("Failed to read bytes for feed {}: {}", feed.name, e);
+                        continue;
+                    }
+                };
+
+                // Парсинг XML вмісту
+                let parsed_feed = match feed_rs::parser::parse(&bytes[..]) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("Failed to parse XML for feed {}: {}", feed.name, e);
+                        continue;
+                    }
+                };
+
+                if let Some(latest_entry) = parsed_feed.entries.first() {
+                    let latest_link = latest_entry.links.first().map(|l| l.href.as_str()).unwrap_or("");
+                    let current_hash = calculate_hash(latest_link);
+
+                    match db::get_feed_last_hash(ctx, &feed.name) {
+                        Ok(Some(saved_hash)) if saved_hash == current_hash => {
+                            info!("Feed '{}' has not changed since last check. Skipping details.", feed.name);
+                            continue; 
+                        }
+                        Ok(_) => {
+                            debug!("Feed '{}' has new content or checked first time.", feed.name);
+                        }
+                        Err(e) => {
+                            warn!("Failed to read feed state from DB for '{}': {}", feed.name, e);
+                        }
+                    }
+
+                    let mut inserted_count = 0;
+                    for entry in &parsed_feed.entries {
+                        let title = entry.title.as_ref().map(|t| t.content.as_str()).unwrap_or("No Title");
+                        let link = entry.links.first().map(|l| l.href.as_str()).unwrap_or("");
+                        
+                        let description_cleaned = entry.summary.as_ref()
+                            .map(|s| sanitize_html(&s.content));
+                        
+                        let pub_date = entry.updated.or(entry.published)
+                            .map(|dt| dt.to_rfc3339())
+                            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+                        match db::insert_raw_article(ctx, &feed.name, title, link, description_cleaned.as_deref(), &pub_date) {
+                            Ok(0) => debug!("Article already exists: {}", link), 
+                            Ok(_) => inserted_count += 1, 
+                            Err(e) => error!("Failed to save article to DB: {}", e),
+                        }
+                    }
+
+                    info!("Processed '{}'. Inserted {} new articles.", feed.name, inserted_count);
+
+                    if let Err(e) = db::update_feed_state(ctx, &feed.name, &current_hash) {
+                        error!("Failed to update feed state in DB for '{}': {}", feed.name, e);
+                    }
+                } else {
+                    warn!("Feed '{}' is empty.", feed.name);
+                }
+            }
+            Err(e) => {
+                error!("Emulated HTTP request failed for feed {}: {}", feed.name, e);
+            }
+        }
+    }
+
+    info!("FETCH process completed successfully.");
+}
+
+fn sanitize_html(html: &str) -> String {
+    let mut cleaned = String::with_capacity(html.len());
+    let mut in_tag = false;
+
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ => {
+                if !in_tag {
+                    cleaned.push(c);
+                }
+            }
+        }
+    }
+
+    let decoded = html_escape::decode_html_entities(&cleaned).into_owned();
+
+    decoded
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
+fn calculate_hash(text: &str) -> String {
+    let digest = md5::compute(text.as_bytes());
+    format!("{:x}", digest)
+}
+
+
+=== FILE: ./src/commands/process.rs ===
+// src/commands/process.rs
+
+use crate::AppContext;
+use crate::db;
+use tracing::{info, error, warn, debug};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AiAnalysis {
+    pub score: i32,
+    pub event_slug: String,
+    pub reason: String,
+    pub category: String
+}
+
+pub async fn run(ctx: &AppContext, target_article_id: Option<i32>) {
+    info!("Starting PROCESS stage (AI Analysis)...");
+
+    let api_key = &ctx.config.gemini_api_key;
+
+    let mut articles = match db::get_unprocessed_articles(ctx) {
+        Ok(list) => list,
+        Err(e) => {
+            error!("Failed to fetch unprocessed articles from DB: {}", e);
+            return;
+        }
+    };
+
+    if articles.is_empty() {
+        info!("No new articles to process.");
+        return;
+    }
+
+    match target_article_id {
+        Some(target_id) => {
+            articles.retain(|a| a.id == target_id);
+            if articles.is_empty() {
+                warn!("Article with ID {} not found or already processed.", target_id);
+                return;
+            }
+            info!("Target mode: Processing single article with ID {}.", target_id);
+        }
+        None => {
+            articles.truncate(1);
+            info!("Batch mode: Picked the single oldest unprocessed article for test.");
+        }
+    }
+
+    let client = reqwest::Client::new();
+
+    for article in articles {
+        if let Some(target_id) = target_article_id {
+            if article.id != target_id { continue; }
+        }
+
+        info!("Analyzing article [ID: {}]: {}", article.id, article.title);
+
+        let article_context = format!(
+            "FEED: {}\nTITLE: {}\nCONTEXT:\n{}",
+            article.feed_name,
+            article.title,
+            article.description.unwrap_or_else(|| "No details".to_string())
+        );
+
+        match call_gemini_api(&ctx, &client, &api_key, &ctx.config.prompts.scoring, &article_context).await {
+            Ok(analysis) => {
+                info!("AI Category: {} | Score: {} | Slug: [{}]", analysis.category, analysis.score, analysis.event_slug);
+
+                if let Err(e) = db::update_processed_article(
+                    &ctx, 
+                    article.id, 
+                    analysis.score,
+                    &analysis.category, 
+                    &analysis.event_slug, 
+                    &analysis.reason, 
+                ) {
+                    error!("Failed to save AI results to DB for ID {}: {}", article.id, e);
+                }
+            }
+            Err(e) => {
+                error!("Gemini API failed for article {}: {}", article.id, e);
+            }
+        }
+    }
+
+    info!("PROCESS stage completed.");
+}
+
+async fn call_gemini_api(
+    ctx: &AppContext, 
+    client: &reqwest::Client,
+    api_key: &str,
+    system_instruction: &str,
+    content_text: &str,
+) -> Result<AiAnalysis, Box<dyn std::error::Error>> {
+    let payload = json!({
+        "systemInstruction": {
+            "parts": [{ "text": system_instruction }]
+        },
+        "contents": [{
+            "parts": [{ "text": content_text }]
+        }],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "object",
+                "properties": {
+                    "reason": { 
+                        "type": "string", 
+                        "description": "Brief justification for score and category" 
+                    },
+                    "category": { 
+                        "type": "string",
+                        "enum": ["programming_ai", "biotech_med", "mechanics", "communications", "drones", "electronics", "space_energy", "other"]
+                    },
+                    "event_slug": {
+                        "type": "string",
+                        "description": "short slug indentifier of article in cebab-case"
+                    },
+                    "score": { 
+                        "type": "integer", 
+                        "description": "Innovation score from 1 to 10" 
+                    }
+                },
+                "required": ["reason", "category", "event_slug", "score"]
+            }
+        }
+    });
+    
+    let response = client.post(&ctx.config.gemini_api_url)
+        .header("X-goog-api-key", api_key) // <-- Ключ тепер тут
+        .json(&payload)
+        .send()
+        .await?;
+
+    let status = response.status();
+    debug!("Gemini HTTP response status code received: {}", status);
+
+    if !status.is_success() {
+        let err_body = response.text().await?;
+            
+        error!("=================== GEMINI RAW ERROR RESPONSE ===================");
+        error!("HTTP STATUS: {}", status);
+        error!("JSON BODY:\n{}", err_body);
+        error!("================================================================");
+
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err("Gemini API Rate Limit reached (429). Please slow down.".into());
+        }
+        return Err(format!("Gemini API failed with status {}. See raw body above.", status).into());
+    }
+
+    let json_resp: serde_json::Value = response.json().await?;
+    
+    let raw_json_text = json_resp["candidates"][0]["content"]["parts"][0]["text"]
+        .as_str()
+        .ok_or("Failed to extract text from Gemini response structure")?;
+
+    let analysis: AiAnalysis = serde_json::from_str(raw_json_text)?;
+    Ok(analysis)
+}
+
+
+=== FILE: ./src/commands/publish.rs ===
+use crate::AppContext;
+use tracing::{info, debug};
+
+pub async fn run(ctx: &AppContext, category: String,) {
+    info!("Starting PUBLISH process...");
+    if ctx.is_debug {
+        debug!("[DEBUG] Category: {:?}", category);
+    }
+    
+    info!("PUBLISH process completed.");
+}
+
+
+=== FILE: ./src/commands/install.rs ===
+use crate::AppContext;
+use crate::db;
+use tracing::{info, error};
+
+pub async fn run(ctx: &AppContext) {
+    info!("Starting Postman infrastructure installation...");
+
+    if let Err(e) = db::run_migrations(&ctx) {
+        error!("Database schema installation failed: {}", e);
+        std::process::exit(1);
+    }
+
+    // TODO: create and install systemd timer files
+    // info!("Installing systemd timers...");
+
+    info!("Installation phase completed. System is ready for runtime processes.");
+}
+
+
+=== FILE: ./src/commands/mod.rs ===
+pub mod fetch;
+pub mod process;
+pub mod publish;
+pub mod stats;
+pub mod install;
+
+
+=== FILE: ./src/commands/stats.rs ===
+use crate::AppContext;
+use tracing::{info, debug};
+
+pub async fn run(ctx: &AppContext, period: String,) {
+    info!("Starting STATS process...");
+    if ctx.is_debug {
+        debug!("[DEBUG] Period: {:?}", period);
+    }
+    // TODO: Implement RSS feed processing
+    info!("STATS process completed.");
+}
+
+
+=== FILE: ./src/db.rs ===
+use crate::AppContext;
+use rusqlite::{Connection, Result};
+use tracing::{info};
+
+pub struct RawArticle {
+    pub id: i32,
+    pub feed_name: String,
+    pub title: String,
+    pub description: Option<String>,
+}
+
+pub fn get_connection(db_path: &str) -> Result<Connection> {
+    let conn = Connection::open(db_path)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    Ok(conn)
+}
+
+// Initialize DB and create tables if they don't exist
+pub fn run_migrations(ctx: &AppContext) -> Result<&Connection> {
+    let conn = &ctx.db;
+
+    // We use UNIQUE on 'url' to automatically reject duplicate articles
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS articles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            duplicate_of INTEGER DEFAULT NULL,
+            is_leader BOOLEAN DEFAULT 0,
+            feed_name TEXT NOT NULL,
+            title TEXT NOT NULL,
+            link TEXT NOT NULL UNIQUE, 
+            description TEXT,
+            category TEXT,
+            pub_date DATETIME NOT NULL,
+            event_slug TEXT DEFAULT NULL,
+            score INTEGER DEFAULT NULL,
+            summary TEXT DEFAULT NULL,
+            is_sent BOOLEAN DEFAULT 0,
+            is_published BOOLEAN DEFAULT 0,
+            metadata TEXT DEFAULT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS feed_state (
+            feed_name TEXT PRIMARY KEY,
+            last_checked_at DATETIME NOT NULL,
+            last_item_hash TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    // Add indexes for faster lookups
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_articles_event_slug ON articles(event_slug)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_articles_status ON articles(is_sent, is_published, is_leader)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_articles_duplicate_of ON articles(duplicate_of)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_articles_feed_date ON articles(feed_name, pub_date)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category, pub_date)",
+        [],
+    )?;
+
+    info!("Database initialized.");
+    Ok(&ctx.db)
+}
+
+pub fn insert_raw_article(
+    ctx: &AppContext,
+    feed_name: &str,
+    title: &str,
+    link: &str,
+    description: Option<&str>,
+    pub_date: &str,
+) -> Result<usize> {
+    let conn = &ctx.db;
+    conn.execute(
+        "INSERT OR IGNORE INTO articles (feed_name, title, link, description, pub_date) 
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![feed_name, title, link, description, pub_date],
+    )
+}
+
+pub fn get_feed_last_hash(ctx: &AppContext, feed_name: &str) -> Result<Option<String>> {
+    let conn = &ctx.db;
+    let mut stmt = conn.prepare("SELECT last_item_hash FROM feed_state WHERE feed_name = ?1")?;
+    
+    let mut rows = stmt.query([feed_name])?;
+    
+    if let Some(row) = rows.next()? {
+        let hash: String = row.get(0)?;
+        Ok(Some(hash))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn update_feed_state(ctx: &AppContext, feed_name: &str, last_hash: &str) -> Result<()> {
+    let conn = &ctx.db;
+    conn.execute(
+        "INSERT INTO feed_state (feed_name, last_checked_at, last_item_hash) 
+         VALUES (?1, CURRENT_TIMESTAMP, ?2)
+         ON CONFLICT(feed_name) DO UPDATE SET 
+            last_checked_at = CURRENT_TIMESTAMP,
+            last_item_hash = EXCLUDED.last_item_hash",
+        rusqlite::params![feed_name, last_hash],
+    )?;
+    Ok(())
+}
+
+pub fn get_unprocessed_articles(ctx: &AppContext) -> Result<Vec<RawArticle>> {
+    let conn = &ctx.db;
+    let mut stmt = conn.prepare(
+        "SELECT id, feed_name, title, description 
+         FROM articles 
+         WHERE event_slug IS NULL 
+         ORDER BY id ASC"
+    )?;
+
+    let article_iter = stmt.query_map([], |row| {
+        Ok(RawArticle {
+            id: row.get(0)?,
+            feed_name: row.get(1)?,
+            title: row.get(2)?,
+            description: row.get(3)?,
+        })
+    })?;
+
+    let mut articles = Vec::new();
+    for article in article_iter {
+        articles.push(article?);
+    }
+
+    Ok(articles)
+}
+
+pub fn update_processed_article(
+    ctx: &AppContext,
+    id: i32,
+    score: i32,
+    category: &str,
+    event_slug: &str,
+    reason: &str,
+) -> rusqlite::Result<()> {
+    let conn = &ctx.db;
+    conn.execute(
+        "UPDATE articles 
+         SET score = ?, category = ?, summary = ?, event_slug = ?, is_sent = 0 
+         WHERE id = ?",
+        rusqlite::params![score, category, reason, event_slug,  id],
+    )?;
+    Ok(())
+}
+
+
+=== FILE: ./Cargo.toml ===
+[package]
+name = "postman"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.44"
+clap = { version = "4.6.1", features = ["derive"] }
+feed-rs = "2.3.1"
+html-escape = "0.2.13"
+md5 = "0.8.0"
+reqwest = { version = "0.13.3", features = ["json"] }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+serde_yaml = "0.9.34"
+tokio = { version = "1.52.3", features = ["full"] }
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+wreq = "5.3.0"
+wreq-util = "2.2.6"
+
+
+
