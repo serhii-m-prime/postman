@@ -11,6 +11,7 @@ html-escape = "0.2.13"
 md5 = "0.8.0"
 reqwest = { version = "0.13.3", features = ["json"] }
 rusqlite = { version = "0.39.0", features = ["bundled"] }
+scraper = "0.27.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml = "0.9.34"
@@ -18,5 +19,5 @@ tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-wreq = "5.3.0"
+wreq = { version = "5.3.0", features = ["json"] }
 wreq-util = "2.2.6"

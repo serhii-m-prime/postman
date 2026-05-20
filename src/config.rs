@@ -6,7 +6,7 @@ pub struct Config {
     pub mysqlite_path: String,
     pub gemini_api_key: String,
     pub gemini_api_url: String,
-    pub articles_in_post: String,
+    pub articles_in_post: i32,
     pub feeds: Vec<FeedConfig>,
     pub prompts: Prompts,
     pub filters: Filters,
@@ -18,6 +18,7 @@ pub struct FeedConfig {
     pub name: String,
     pub url: String,
     pub poll_interval_min: u64,
+    pub content_selector: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

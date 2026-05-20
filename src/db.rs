@@ -11,6 +11,7 @@ pub struct RawArticle {
 
 pub struct PublishableArticle {
     pub id: i32,
+    pub feed_name: String, // Added field
     pub title: String,
     pub link: String,
     pub event_slug: String,
@@ -190,9 +191,9 @@ pub fn get_best_unpublished_articles(
     // 4. Use ROW_NUMBER to partition by event_slug and sort by score DESC
     // 5. Select only rn = 1 (the highest scored article per event)
     let query = "
-        SELECT id, title, link, event_slug, score 
+        SELECT id, feed_name, title, link, event_slug, score 
         FROM (
-            SELECT id, title, link, event_slug, score,
+            SELECT id, feed_name, title, link, event_slug, score,
                    ROW_NUMBER() OVER(
                        PARTITION BY event_slug 
                        ORDER BY score DESC, pub_date DESC
@@ -212,13 +213,14 @@ pub fn get_best_unpublished_articles(
     let mut stmt = conn.prepare(query)?;
     
     // Map the database row to our struct
-    let article_iter = stmt.query_map([target_category, &ctx.config.articles_in_post], |row| {
+    let article_iter = stmt.query_map([target_category, "1"], |row| {
         Ok(PublishableArticle {
             id: row.get(0)?,
-            title: row.get(1)?,
-            link: row.get(2)?,
-            event_slug: row.get(3)?,
-            score: row.get(4)?,
+            feed_name: row.get(1)?,
+            title: row.get(2)?,
+            link: row.get(3)?,
+            event_slug: row.get(4)?,
+            score: row.get(5)?,
         })
     })?;
 
@@ -228,4 +230,34 @@ pub fn get_best_unpublished_articles(
     }
 
     Ok(articles)
+}
+
+pub async fn mark_as_published(ctx: &AppContext, article_id: i32) -> rusqlite::Result<()> {
+    // TODO: Move this query to src/db.rs later
+    let conn = &ctx.db;
+    conn.execute(
+        "UPDATE articles SET is_published = 1 WHERE id = ?1",
+        rusqlite::params![article_id],
+    )?;
+    Ok(())
+}
+
+// Mark article as skipped to exclude it from future publish attempts
+pub fn mark_article_as_skipped(
+    ctx: &AppContext, 
+    id: i32, 
+    current_slug: &str
+) -> Result<()> {
+    let conn = &ctx.db;
+    let skipped_slug = format!("{}-skipped", current_slug);
+    
+    // Set both is_published and is_sent to 1 to completely drop it from the pipeline
+    conn.execute(
+        "UPDATE articles 
+         SET event_slug = ?1, is_published = 1, is_sent = 1 
+         WHERE id = ?2",
+        rusqlite::params![skipped_slug, id],
+    )?;
+    
+    Ok(())
 }

@@ -21,3 +21,4 @@ feeds:
   - name: "hackaday"
     url: "https://hackaday.com/blog/feed/"
     poll_interval_min: 60
+    content_selector: "div.entry-content p" # Specific selector
