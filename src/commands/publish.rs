@@ -5,6 +5,15 @@ use serde_json::{json, Value};
 use scraper::{Html, Selector};
 use wreq::Client;
 use wreq_util::Emulation;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct EnrichmentResult {
+    translated_title: String,
+    emoji: String,
+    summary: String,
+    tags: Vec<String>,
+}
 
 pub async fn run(ctx: &AppContext, category: String) {
     info!("Starting PUBLISH process for category: {}", category);
@@ -45,7 +54,7 @@ pub async fn run(ctx: &AppContext, category: String) {
 
         if ctx.is_debug {
             debug!("Using selector '{}' for article from feed '{}'", css_selector, article.feed_name);
-            send_debug_log(ctx, &client, &format!("Using selector '{}' for article from feed '{}'", css_selector, article.feed_name), true).await;
+            send_debug_log(ctx, &client, &format!("Using selector '{}' for article from feed '{}' score: {}", css_selector, article.feed_name, article.score), true).await;
         }
 
         // Stage 2: Scraping
@@ -72,7 +81,7 @@ pub async fn run(ctx: &AppContext, category: String) {
         };
 
         // Stage 3: Summarization
-        let summary = match summarize_article(ctx, &client, &content).await {
+        let enriched = match summarize_article(ctx, &client, &article.title, &content).await {
             Ok(sum) => sum,
             Err(e) => {
                 error!("Failed to summarize article {}: {}", article.id, e);
@@ -82,7 +91,7 @@ pub async fn run(ctx: &AppContext, category: String) {
         };
 
         // Stage 4: Telegram Delivery
-        let is_sent = send_to_telegram(ctx, &client, article, &summary).await;
+        let is_sent = send_to_telegram(ctx, &client, article, &enriched).await;
 
         // Stage 5: DB Update & Counter
         if is_sent {
@@ -158,24 +167,50 @@ async fn scrape_content(client: &wreq::Client, url: &str, selector_str: &str) ->
 // --- STAGE 3: LLM Summarization ---
 async fn summarize_article(
     ctx: &AppContext, 
-    client: &wreq::Client, 
+    client: &wreq::Client,
+    article_title: &str, 
     text: &str
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<EnrichmentResult, Box<dyn std::error::Error>> {
     // Assuming you have 'enrichment' or 'publish' prompt in your config
     let system_prompt = &ctx.config.prompts.enrichment; 
 
     let url = format!("{}?key={}", &ctx.config.gemini_api_url, &ctx.config.gemini_api_key);
 
     // Build the request structure expected by the Gemini API
+    let content_text = format!("TITLE: {}\n\nCONTENT:\n{}", article_title, text);
     let payload = json!({
         "system_instruction": {
             "parts": { "text": system_prompt }
         },
         "contents": [{
-            "parts": [{ "text": text }]
+            "parts": [{ "text": content_text }]
         }],
         "generationConfig": {
-            "temperature": 0.3 // Low temperature for factual, deterministic summaries
+            "temperature": 0.3,
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "object",
+                "properties": {
+                    "translated_title": { 
+                        "type": "string",
+                        "description": "Catchy translated title in Ukrainian"
+                    },
+                    "emoji": { 
+                        "type": "string",
+                        "description": "Exactly one highly relevant emoji"
+                    },
+                    "summary": { 
+                        "type": "string",
+                        "description": "3-7 sentences summary in Ukrainian"
+                    },
+                    "tags": { 
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "3-5 relevant short tags in English without # symbol"
+                    }
+                },
+                "required": ["translated_title", "emoji", "summary", "tags"]
+            }
         }
     });
 
@@ -183,11 +218,14 @@ async fn summarize_article(
 
     // Handle standard Free Tier rate limits gracefully
     if response.status().as_u16() == 429 {
+        send_debug_log(ctx, &client, "Gemini API Rate Limit Exceeded (429 Too Many Requests)", true).await;
         return Err("Gemini API Rate Limit Exceeded (429 Too Many Requests)".into());
     }
 
     if !response.status().is_success() {
         let err_body = response.text().await?;
+        let error_string = format!("Gemini API returned error: {}", err_body);
+        send_debug_log(ctx, &client, &error_string, true).await;
         return Err(format!("Gemini API returned error: {}", err_body).into());
     }
 
@@ -195,13 +233,13 @@ async fn summarize_article(
     let json_resp: Value = response.json().await?;
 
     // Safely extract the generated text from the deeply nested JSON structure
-    let summary = json_resp["candidates"][0]["content"]["parts"][0]["text"]
+    let raw_json_text = json_resp["candidates"][0]["content"]["parts"][0]["text"]
         .as_str()
-        .ok_or("Failed to extract 'text' field from Gemini response")?
-        .trim()
-        .to_string();
+        .ok_or("Failed to extract 'text' field from Gemini response")?;
 
-    Ok(summary)
+    let enrichment_result: EnrichmentResult = serde_json::from_str(raw_json_text)?;
+
+    Ok(enrichment_result)
 }
 
 // --- STAGE 4: Telegram Integration ---
@@ -209,7 +247,7 @@ async fn send_to_telegram(
     ctx: &AppContext, 
     client: &wreq::Client, 
     article: &PublishableArticle, 
-    summary: &str
+    enriched: &EnrichmentResult
 ) -> bool {
     let token = &ctx.config.telegram.bot_token;
     let channel_id = if ctx.is_debug {
@@ -218,10 +256,20 @@ async fn send_to_telegram(
         &ctx.config.telegram.main_channel_id
     };
 
+    let tags_str = enriched.tags.iter()
+        .map(|t| format!("#{}", t.replace(" ", "_").replace("-", "_")))
+        .collect::<Vec<_>>()
+        .join(" ");
+
     // Format the final message (e.g., MarkdownV2 or HTML)
     let message = format!(
-        "<b>{}</b>\n\n{}\n\n<a href=\"{}\">Читати оригінал</a>", 
-        article.title, summary, article.link
+        "{} <b>{}</b>\n\n{}\n\n{}\n\n<a href=\"{}\">Читати оригінал\n(score:{})</a>", 
+        enriched.emoji, 
+        enriched.translated_title, 
+        enriched.summary, 
+        tags_str,
+        article.link,
+        article.score
     );
 
     let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
@@ -230,7 +278,9 @@ async fn send_to_telegram(
         "chat_id": channel_id,
         "text": message,
         "parse_mode": "HTML",
-        "disable_web_page_preview": false
+        "no_webpage": true,
+        "disable_web_page_preview": true,
+        "invert_media": true
     });
 
     // TODO: Execute POST request using client
@@ -238,7 +288,7 @@ async fn send_to_telegram(
     // Check if resp.status().is_success() and return true/false
 
     if ctx.is_debug {
-        debug!("[DEBUG] Simulated sending to TG Channel {}:\n{}\n\n {} \n\n", channel_id, message, summary);
+        debug!("[DEBUG] Simulated sending to TG Channel {}:\n{}\n\n {} \n\n", channel_id, message, enriched.summary);
     }
 
     if let Err(e) = client.post(&url).json(&payload).send().await {
@@ -258,7 +308,7 @@ async fn send_debug_log(ctx: &AppContext, client: &wreq::Client, message: &str, 
         "chat_id": channel_id,
         "text": message,
         "parse_mode": "HTML",
-        "disable_web_page_preview": true,
+        "no_webpage": true,
         "disable_notification": disable_notification
     });
 

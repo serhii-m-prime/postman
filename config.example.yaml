@@ -5,7 +5,7 @@ articles_in_post: 3
 
 prompts:
   scoring: "You are a strict technical expert. Score the news from 1 to 10..."
-  enrichment: "Summarize this article in 3-4 sentences in Ukrainian..."
+  enrichment: "You are a tech journalist. Read the article content. Translate its title to Ukrainian. Choose one highly relevant emoji. Write a concise, engaging summary in 3-4 sentences in Ukrainian. Provide 3-5 relevant short tags (e.g., ai, space, tech)...."
 
 filters:
   blacklist:

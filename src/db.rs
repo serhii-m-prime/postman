@@ -140,7 +140,7 @@ pub fn get_unprocessed_articles(ctx: &AppContext) -> Result<Vec<RawArticle>> {
         "SELECT id, feed_name, title, description 
          FROM articles 
          WHERE event_slug IS NULL 
-         ORDER BY id ASC"
+         ORDER BY id DESC"
     )?;
 
     let article_iter = stmt.query_map([], |row| {
@@ -193,20 +193,22 @@ pub fn get_best_unpublished_articles(
     let query = "
         SELECT id, feed_name, title, link, event_slug, score 
         FROM (
-            SELECT id, feed_name, title, link, event_slug, score,
-                   ROW_NUMBER() OVER(
-                       PARTITION BY event_slug 
-                       ORDER BY score DESC, pub_date DESC
-                   ) as rn
+            SELECT id, feed_name, title, link, event_slug, score, pub_date,
+                ROW_NUMBER() OVER(
+                    PARTITION BY event_slug
+                    ORDER BY score DESC, pub_date DESC 
+                ) as rn
             FROM articles
             WHERE is_published = 0 
-              AND is_sent = 0 
-              AND event_slug IS NOT NULL 
-              AND score IS NOT NULL
-              AND (category = ?1 OR ?1 = 'general')
+            AND is_sent = 0 
+            AND event_slug IS NOT NULL 
+            AND score IS NOT NULL
+            AND (category = ?1 OR ?1 = 'general')
+            AND pub_date >= datetime('now', '-7 days')
         ) 
         WHERE rn = 1
-        ORDER BY score DESC
+        -- Sort leaders by score first, then by recency for tied scores
+        ORDER BY score DESC, pub_date DESC 
         LIMIT ?2
     ";
     
