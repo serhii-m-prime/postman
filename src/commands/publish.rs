@@ -88,8 +88,8 @@ pub async fn run(ctx: &AppContext, category: String) {
             Err(e) => {
                 error!("Failed to summarize article {}: {}", article.id, e);
                 let err_msg = e.to_string();
-                if err_msg.contains("429") || err_msg.to_lowercase().contains("rate limit") {
-                    warn!("Gemini API rate limit exceeded during summarization. Pausing with 60s timeout and halting publish pipeline to prevent server spam.");
+                if err_msg.contains("exhausted") || err_msg.contains("rate-limited") || err_msg.contains("high demand") || err_msg.contains("429") || err_msg.contains("503") {
+                    warn!("All Gemini models are currently latched in cooldown. Pausing with 60s timeout and halting publish pipeline.");
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     break;
                 } else {
@@ -215,10 +215,7 @@ async fn summarize_article(
     article_title: &str, 
     text: &str
 ) -> Result<EnrichmentResult, Box<dyn std::error::Error>> {
-    // Assuming you have 'enrichment' or 'publish' prompt in your config
     let system_prompt = &ctx.config.prompts.enrichment; 
-
-    let url = format!("{}?key={}", &ctx.config.gemini_api_url, &ctx.config.gemini_api_key);
 
     // Build the request structure expected by the Gemini API
     let content_text = format!("TITLE: {}\n\nCONTENT:\n{}", article_title, text);
@@ -230,7 +227,6 @@ async fn summarize_article(
             "parts": [{ "text": content_text }]
         }],
         "generationConfig": {
-            "temperature": 0.3,
             "responseMimeType": "application/json",
             "responseSchema": {
                 "type": "object",
@@ -258,40 +254,64 @@ async fn summarize_article(
         }
     });
 
-    let max_retries = rate_limit::MAX_RETRIES;
-    for attempt in 0..=max_retries {
-        let response = client.post(&url).json(&payload).send().await?;
+    let configured_models = ctx.config.get_models();
 
-        // Handle standard Free Tier rate limits gracefully with timeout backoff
-        if response.status().as_u16() == 429 {
-            let header_retry = response.headers().get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(rate_limit::parse_retry_after_str);
-
-            let err_body = response.text().await.unwrap_or_default();
-            let body_delay = rate_limit::parse_gemini_retry_delay(&err_body);
-
-            let wait_secs = header_retry
-                .or(body_delay)
-                .unwrap_or(rate_limit::DEFAULT_LLM_TIMEOUT_SECS);
-
-            if attempt < max_retries {
-                rate_limit::sleep_with_reason(
-                    wait_secs,
-                    &format!("Gemini API Rate Limit Exceeded (429) during summarization. Attempt {}/{}", attempt + 1, max_retries),
-                ).await;
-                continue;
-            } else {
-                send_debug_log(ctx, client, "Gemini API Rate Limit Exceeded (429 Too Many Requests) after retries with timeout", true).await;
-                return Err("Gemini API Rate Limit Exceeded (429 Too Many Requests)".into());
-            }
+    // Iterate through models from newest/best to oldest
+    for model_name in &configured_models {
+        // Check if model is currently latched in cooldown
+        if let Ok(Some(cooldown_until)) = db::get_model_cooldown(ctx, model_name) {
+            info!("Model '{}' is latched in cooldown until {}. Skipping...", model_name, cooldown_until);
+            continue;
         }
 
-        if !response.status().is_success() {
-            let err_body = response.text().await?;
-            let error_string = format!("Gemini API returned error: {}", err_body);
-            send_debug_log(ctx, client, &error_string, true).await;
-            return Err(format!("Gemini API returned error: {}", err_body).into());
+        let url = ctx.config.get_gemini_url(model_name);
+        info!("Calling Gemini model for summarization: {}", model_name);
+
+        let response = match client.post(&url)
+            .header("X-goog-api-key", &ctx.config.gemini_api_key)
+            .json(&payload)
+            .send()
+            .await 
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!("Network error calling Gemini model {}: {}", model_name, e);
+                continue;
+            }
+        };
+
+        let status = response.status();
+        let status_code = status.as_u16();
+
+        if !status.is_success() {
+            let err_body = response.text().await.unwrap_or_default();
+            let err_type = rate_limit::classify_gemini_error(status_code, &err_body);
+
+            match err_type {
+                rate_limit::GeminiErrorType::RpmLimit
+                | rate_limit::GeminiErrorType::TpmLimit
+                | rate_limit::GeminiErrorType::RpdLimit
+                | rate_limit::GeminiErrorType::HighDemand503 => {
+                    if let Some(until) = err_type.cooldown_until() {
+                        warn!(
+                            "Model '{}' encountered HTTP {} ({}). Latched until {}. Jumping to next model in chain...",
+                            model_name,
+                            status_code,
+                            err_type.description(),
+                            until
+                        );
+                        if let Err(e) = db::set_model_cooldown(ctx, model_name, until, err_type.description()) {
+                            error!("Failed to save model cooldown in DB: {}", e);
+                        }
+                    }
+                    continue; // Jump to next model in the fallback chain!
+                }
+                rate_limit::GeminiErrorType::Other => {
+                    let error_string = format!("Gemini API returned error for model {}: {}", model_name, err_body);
+                    send_debug_log(ctx, client, &error_string, true).await;
+                    return Err(format!("Gemini API returned error: {}", err_body).into());
+                }
+            }
         }
 
         // Parse the JSON response
@@ -306,7 +326,12 @@ async fn summarize_article(
         return Ok(enrichment_result);
     }
 
-    Err("Gemini API summarization failed after retries".into())
+    if let Ok(Some((earliest_model, earliest_time))) = db::get_earliest_cooldown(ctx, &configured_models) {
+        let msg = format!("All Gemini models exhausted. Earliest available: '{}' at {}.", earliest_model, earliest_time);
+        error!("{}", msg);
+        send_debug_log(ctx, client, &msg, true).await;
+    }
+    Err("All Gemini models in fallback chain are currently rate-limited, high-demand (503), or unavailable.".into())
 }
 
 // --- STAGE 4: Telegram Integration ---

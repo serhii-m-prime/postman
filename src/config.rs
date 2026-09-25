@@ -6,6 +6,7 @@ pub struct Config {
     pub mysqlite_path: String,
     pub gemini_api_key: String,
     pub gemini_api_url: String,
+    pub gemini_models: Option<Vec<String>>,
     pub articles_in_post: i32,
     pub feeds: Vec<FeedConfig>,
     pub prompts: Prompts,
@@ -50,5 +51,27 @@ impl Config {
         let content = fs::read_to_string(path)?;
         let config: Config = serde_yaml::from_str(&content)?;
         Ok(config)
+    }
+
+    /// Returns the ordered list of Gemini models from best to oldest.
+    pub fn get_models(&self) -> Vec<String> {
+        if let Some(ref models) = self.gemini_models {
+            if !models.is_empty() {
+                return models.clone();
+            }
+        }
+        vec![
+            "gemini-3.8-flash".to_string(),
+            "gemini-3.7-flash".to_string(),
+            "gemini-3.6-flash".to_string(),
+            "gemini-3.5-flash".to_string(),
+            "gemini-3.5-flash-lite".to_string(),
+            "gemini-3.1-flash-lite".to_string(),
+        ]
+    }
+
+    /// Resolves the Gemini API URL for a specific model using `gemini_api_url` template.
+    pub fn get_gemini_url(&self, model: &str) -> String {
+        crate::rate_limit::format_gemini_url(&self.gemini_api_url, model)
     }
 }

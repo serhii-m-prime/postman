@@ -22,6 +22,14 @@ pub fn get_connection(db_path: &str) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS model_state (
+            model_name TEXT PRIMARY KEY,
+            unavailable_until DATETIME NOT NULL,
+            reason TEXT NOT NULL
+        )",
+        [],
+    )?;
     Ok(conn)
 }
 
@@ -57,6 +65,15 @@ pub fn run_migrations(ctx: &AppContext) -> Result<&Connection> {
             feed_name TEXT PRIMARY KEY,
             last_checked_at DATETIME NOT NULL,
             last_item_hash TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS model_state (
+            model_name TEXT PRIMARY KEY,
+            unavailable_until DATETIME NOT NULL,
+            reason TEXT NOT NULL
         )",
         [],
     )?;
@@ -132,6 +149,69 @@ pub fn update_feed_state(ctx: &AppContext, feed_name: &str, last_hash: &str) -> 
         rusqlite::params![feed_name, last_hash],
     )?;
     Ok(())
+}
+
+pub fn get_model_cooldown(ctx: &AppContext, model: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    let conn = &ctx.db;
+    let mut stmt = conn.prepare("SELECT unavailable_until FROM model_state WHERE model_name = ?1")?;
+    let mut rows = stmt.query([model])?;
+    if let Some(row) = rows.next()? {
+        let until_str: String = row.get(0)?;
+        if let Ok(until) = chrono::DateTime::parse_from_rfc3339(&until_str) {
+            let until_utc = until.with_timezone(&chrono::Utc);
+            if until_utc > chrono::Utc::now() {
+                return Ok(Some(until_utc));
+            }
+        }
+    }
+    Ok(None)
+}
+
+pub fn set_model_cooldown(
+    ctx: &AppContext,
+    model: &str,
+    until: chrono::DateTime<chrono::Utc>,
+    reason: &str,
+) -> Result<()> {
+    let conn = &ctx.db;
+    let until_str = until.to_rfc3339();
+    conn.execute(
+        "INSERT INTO model_state (model_name, unavailable_until, reason)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(model_name) DO UPDATE SET
+            unavailable_until = EXCLUDED.unavailable_until,
+            reason = EXCLUDED.reason",
+        rusqlite::params![model, until_str, reason],
+    )?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn get_first_available_model(ctx: &AppContext, models: &[String]) -> Result<Option<String>> {
+    for model in models {
+        if get_model_cooldown(ctx, model)?.is_none() {
+            return Ok(Some(model.clone()));
+        }
+    }
+    Ok(None)
+}
+
+pub fn get_earliest_cooldown(ctx: &AppContext, models: &[String]) -> Result<Option<(String, chrono::DateTime<chrono::Utc>)>> {
+    let mut earliest: Option<(String, chrono::DateTime<chrono::Utc>)> = None;
+    for model in models {
+        if let Some(until) = get_model_cooldown(ctx, model)? {
+            match &earliest {
+                Some((_, earliest_until)) if until < *earliest_until => {
+                    earliest = Some((model.clone(), until));
+                }
+                None => {
+                    earliest = Some((model.clone(), until));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(earliest)
 }
 
 pub fn get_unprocessed_articles(ctx: &AppContext) -> Result<Vec<RawArticle>> {

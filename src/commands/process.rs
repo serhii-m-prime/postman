@@ -83,8 +83,8 @@ pub async fn run(ctx: &AppContext, target_article_id: Option<i32>) {
             Err(e) => {
                 error!("Gemini API failed for article {}: {}", article.id, e);
                 let err_msg = e.to_string();
-                if err_msg.contains("429") || err_msg.to_lowercase().contains("rate limit") {
-                    warn!("Gemini API rate limit (429) persists after retries. Pausing with 60s timeout and halting PROCESS stage to prevent server spam.");
+                if err_msg.contains("exhausted") || err_msg.contains("rate-limited") || err_msg.contains("high demand") || err_msg.contains("429") || err_msg.contains("503") {
+                    warn!("All Gemini models are currently latched in cooldown. Pausing with 60s timeout and halting PROCESS stage.");
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     break;
                 }
@@ -139,56 +139,70 @@ async fn call_gemini_api(
         }
     });
 
-    let max_retries = rate_limit::MAX_RETRIES;
-    for attempt in 0..=max_retries {
-        let response = client.post(&ctx.config.gemini_api_url)
+    let configured_models = ctx.config.get_models();
+
+    // Iterate through models from newest/best to oldest
+    for model_name in &configured_models {
+        // Check if model is currently latched in cooldown
+        if let Ok(Some(cooldown_until)) = db::get_model_cooldown(ctx, model_name) {
+            info!("Model '{}' is latched in cooldown until {}. Skipping...", model_name, cooldown_until);
+            continue;
+        }
+
+        let url = ctx.config.get_gemini_url(model_name);
+        info!("Calling Gemini model: {}", model_name);
+
+        let response = match client.post(&url)
             .header("X-goog-api-key", api_key)
             .json(&payload)
             .send()
-            .await?;
+            .await 
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!("Network error calling Gemini model {}: {}", model_name, e);
+                continue;
+            }
+        };
 
         let status = response.status();
+        let status_code = status.as_u16();
 
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let header_retry = response.headers().get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(rate_limit::parse_retry_after_str);
-
+        if !status.is_success() {
             let err_body = response.text().await.unwrap_or_default();
-            let body_delay = rate_limit::parse_gemini_retry_delay(&err_body);
+            let err_type = rate_limit::classify_gemini_error(status_code, &err_body);
 
-            let wait_secs = header_retry
-                .or(body_delay)
-                .unwrap_or(rate_limit::DEFAULT_LLM_TIMEOUT_SECS);
-
-            if attempt < max_retries {
-                rate_limit::sleep_with_reason(
-                    wait_secs,
-                    &format!("Gemini API Rate Limit reached (429) during scoring. Attempt {}/{}", attempt + 1, max_retries),
-                ).await;
-                continue;
-            } else {
-                error!("=================== GEMINI RAW ERROR RESPONSE ===================");
-                error!("HTTP STATUS: {}", status);
-                error!("JSON BODY:\n{}", err_body);
-                error!("================================================================");
-                return Err("Gemini API Rate Limit reached (429). Please slow down.".into());
+            match err_type {
+                rate_limit::GeminiErrorType::RpmLimit
+                | rate_limit::GeminiErrorType::TpmLimit
+                | rate_limit::GeminiErrorType::RpdLimit
+                | rate_limit::GeminiErrorType::HighDemand503 => {
+                    if let Some(until) = err_type.cooldown_until() {
+                        warn!(
+                            "Model '{}' encountered HTTP {} ({}). Latched until {}. Jumping to next model in chain...",
+                            model_name,
+                            status_code,
+                            err_type.description(),
+                            until
+                        );
+                        if let Err(e) = db::set_model_cooldown(ctx, model_name, until, err_type.description()) {
+                            error!("Failed to save model cooldown in DB: {}", e);
+                        }
+                    }
+                    continue; // Jump to next model in the fallback chain!
+                }
+                rate_limit::GeminiErrorType::Other => {
+                    error!("=================== GEMINI RAW ERROR RESPONSE ===================");
+                    error!("MODEL: {}", model_name);
+                    error!("HTTP STATUS: {}", status);
+                    error!("JSON BODY:\n{}", err_body);
+                    error!("================================================================");
+                    return Err(format!("Gemini API failed with status {}. See raw body above.", status).into());
+                }
             }
         }
 
-        if !status.is_success() {
-            let err_body = response.text().await?;
-                
-            error!("=================== GEMINI RAW ERROR RESPONSE ===================");
-            error!("HTTP STATUS: {}", status);
-            error!("JSON BODY:\n{}", err_body);
-            error!("================================================================");
-
-            return Err(format!("Gemini API failed with status {}. See raw body above.", status).into());
-        }
-
         let json_resp: serde_json::Value = response.json().await?;
-        
         let raw_json_text = json_resp["candidates"][0]["content"]["parts"][0]["text"]
             .as_str()
             .ok_or("Failed to extract text from Gemini response structure")?;
@@ -197,5 +211,9 @@ async fn call_gemini_api(
         return Ok(analysis);
     }
 
-    Err("Gemini API scoring failed after retries".into())
+    // All models in the list are latched or unavailable
+    if let Ok(Some((earliest_model, earliest_time))) = db::get_earliest_cooldown(ctx, &configured_models) {
+        error!("All Gemini models are exhausted or latched. Earliest available is '{}' at {}.", earliest_model, earliest_time);
+    }
+    Err("All Gemini models in fallback chain are currently rate-limited, high-demand (503), or unavailable.".into())
 }
