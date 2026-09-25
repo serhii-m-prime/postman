@@ -1,6 +1,8 @@
 use crate::AppContext;
 use crate::db::{self, PublishableArticle};
-use tracing::{info, debug, error};
+use crate::rate_limit;
+use std::time::Duration;
+use tracing::{info, debug, error, warn};
 use serde_json::{json, Value};
 use scraper::{Html, Selector};
 use wreq::Client;
@@ -85,8 +87,19 @@ pub async fn run(ctx: &AppContext, category: String) {
             Ok(sum) => sum,
             Err(e) => {
                 error!("Failed to summarize article {}: {}", article.id, e);
-                // Optionally handle LLM failures similarly to scraping failures here
-                continue; 
+                let err_msg = e.to_string();
+                if err_msg.contains("429") || err_msg.to_lowercase().contains("rate limit") {
+                    warn!("Gemini API rate limit exceeded during summarization. Pausing with 60s timeout and halting publish pipeline to prevent server spam.");
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    break;
+                } else {
+                    // For non-rate-limit errors (e.g. content policy blocked, malformed text),
+                    // mark the article as skipped so we don't infinitely retry the same article.
+                    if let Err(db_err) = db::mark_article_as_skipped(ctx, article.id, &article.event_slug) {
+                        error!("Failed to update skipped status in DB for article {}: {}", article.id, db_err);
+                    }
+                    continue; 
+                }
             }
         };
 
@@ -127,8 +140,39 @@ async fn select_articles(ctx: &AppContext, category: &str) -> Vec<PublishableArt
 
 // --- STAGE 2: Scraping ---
 async fn scrape_content(client: &wreq::Client, url: &str, selector_str: &str) -> Result<String, Box<dyn std::error::Error>> {
-    // Fetch HTML page. Emulation automatically handles Headers and TLS.
-    let response = client.get(url).send().await?;
+    let max_retries = 2;
+    let mut response = None;
+
+    for attempt in 0..=max_retries {
+        let resp = client.get(url).send().await?;
+        if resp.status().as_u16() == 429 {
+            let retry_after = resp.headers().get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(rate_limit::parse_retry_after_str)
+                .unwrap_or(rate_limit::DEFAULT_SITE_TIMEOUT_SECS);
+
+            if attempt < max_retries {
+                rate_limit::sleep_with_reason(
+                    retry_after,
+                    &format!("Scraping site '{}' returned 429 (Too Many Requests). Retry attempt {}/{}", url, attempt + 1, max_retries),
+                ).await;
+                continue;
+            } else {
+                rate_limit::sleep_with_reason(
+                    retry_after,
+                    &format!("Scraping site '{}' hit 429 after {} retries", url, max_retries),
+                ).await;
+                return Err(format!("HTTP request failed with status: 429 Too Many Requests for URL: {}", url).into());
+            }
+        }
+        response = Some(resp);
+        break;
+    }
+
+    let response = match response {
+        Some(r) => r,
+        None => return Err("Failed to obtain response while scraping".into()),
+    };
 
     if !response.status().is_success() {
         return Err(format!("HTTP request failed with status: {}", response.status()).into());
@@ -214,32 +258,55 @@ async fn summarize_article(
         }
     });
 
-    let response = client.post(&url).json(&payload).send().await?;
+    let max_retries = rate_limit::MAX_RETRIES;
+    for attempt in 0..=max_retries {
+        let response = client.post(&url).json(&payload).send().await?;
 
-    // Handle standard Free Tier rate limits gracefully
-    if response.status().as_u16() == 429 {
-        send_debug_log(ctx, &client, "Gemini API Rate Limit Exceeded (429 Too Many Requests)", true).await;
-        return Err("Gemini API Rate Limit Exceeded (429 Too Many Requests)".into());
+        // Handle standard Free Tier rate limits gracefully with timeout backoff
+        if response.status().as_u16() == 429 {
+            let header_retry = response.headers().get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(rate_limit::parse_retry_after_str);
+
+            let err_body = response.text().await.unwrap_or_default();
+            let body_delay = rate_limit::parse_gemini_retry_delay(&err_body);
+
+            let wait_secs = header_retry
+                .or(body_delay)
+                .unwrap_or(rate_limit::DEFAULT_LLM_TIMEOUT_SECS);
+
+            if attempt < max_retries {
+                rate_limit::sleep_with_reason(
+                    wait_secs,
+                    &format!("Gemini API Rate Limit Exceeded (429) during summarization. Attempt {}/{}", attempt + 1, max_retries),
+                ).await;
+                continue;
+            } else {
+                send_debug_log(ctx, client, "Gemini API Rate Limit Exceeded (429 Too Many Requests) after retries with timeout", true).await;
+                return Err("Gemini API Rate Limit Exceeded (429 Too Many Requests)".into());
+            }
+        }
+
+        if !response.status().is_success() {
+            let err_body = response.text().await?;
+            let error_string = format!("Gemini API returned error: {}", err_body);
+            send_debug_log(ctx, client, &error_string, true).await;
+            return Err(format!("Gemini API returned error: {}", err_body).into());
+        }
+
+        // Parse the JSON response
+        let json_resp: Value = response.json().await?;
+
+        // Safely extract the generated text from the deeply nested JSON structure
+        let raw_json_text = json_resp["candidates"][0]["content"]["parts"][0]["text"]
+            .as_str()
+            .ok_or("Failed to extract 'text' field from Gemini response")?;
+
+        let enrichment_result: EnrichmentResult = serde_json::from_str(raw_json_text)?;
+        return Ok(enrichment_result);
     }
 
-    if !response.status().is_success() {
-        let err_body = response.text().await?;
-        let error_string = format!("Gemini API returned error: {}", err_body);
-        send_debug_log(ctx, &client, &error_string, true).await;
-        return Err(format!("Gemini API returned error: {}", err_body).into());
-    }
-
-    // Parse the JSON response
-    let json_resp: Value = response.json().await?;
-
-    // Safely extract the generated text from the deeply nested JSON structure
-    let raw_json_text = json_resp["candidates"][0]["content"]["parts"][0]["text"]
-        .as_str()
-        .ok_or("Failed to extract 'text' field from Gemini response")?;
-
-    let enrichment_result: EnrichmentResult = serde_json::from_str(raw_json_text)?;
-
-    Ok(enrichment_result)
+    Err("Gemini API summarization failed after retries".into())
 }
 
 // --- STAGE 4: Telegram Integration ---
@@ -283,18 +350,48 @@ async fn send_to_telegram(
         "invert_media": true
     });
 
-    // TODO: Execute POST request using client
-    // let resp = client.post(&url).json(&payload).send().await;
-    // Check if resp.status().is_success() and return true/false
-
     if ctx.is_debug {
         debug!("[DEBUG] Simulated sending to TG Channel {}:\n{}\n\n {} \n\n", channel_id, message, enriched.summary);
     }
 
-    if let Err(e) = client.post(&url).json(&payload).send().await {
-        error!("Failed to send debug log to Telegram: {}", e);
+    let max_retries = 2;
+    for attempt in 0..=max_retries {
+        match client.post(&url).json(&payload).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.as_u16() == 429 {
+                    let err_body = resp.text().await.unwrap_or_default();
+                    let retry_after = rate_limit::parse_telegram_retry_after(&err_body)
+                        .unwrap_or(rate_limit::DEFAULT_TG_TIMEOUT_SECS);
+                    if attempt < max_retries {
+                        rate_limit::sleep_with_reason(
+                            retry_after,
+                            &format!("Telegram returned 429 Too Many Requests. Attempt {}/{}", attempt + 1, max_retries),
+                        ).await;
+                        continue;
+                    } else {
+                        error!("Telegram returned 429 Too Many Requests after retries.");
+                        return false;
+                    }
+                } else if !status.is_success() {
+                    let err_body = resp.text().await.unwrap_or_default();
+                    error!("Failed to send message to Telegram. Status {}: {}", status, err_body);
+                    return false;
+                } else {
+                    return true;
+                }
+            }
+            Err(e) => {
+                error!("Failed to send message to Telegram: {}", e);
+                if attempt < max_retries {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+                return false;
+            }
+        }
     }
-    true // Return true on success
+    false
 }
 
 // --- HELPER: Telegram Debug Notification ---
@@ -312,7 +409,14 @@ async fn send_debug_log(ctx: &AppContext, client: &wreq::Client, message: &str, 
         "disable_notification": disable_notification
     });
 
-    if let Err(e) = client.post(&url).json(&payload).send().await {
-        error!("Failed to send debug log to Telegram: {}", e);
+    match client.post(&url).json(&payload).send().await {
+        Ok(resp) => {
+            if resp.status().as_u16() == 429 {
+                warn!("Telegram returned 429 on send_debug_log. Skipping to avoid Telegram spam.");
+            }
+        }
+        Err(e) => {
+            error!("Failed to send debug log to Telegram: {}", e);
+        }
     }
 }

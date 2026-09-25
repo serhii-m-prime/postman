@@ -1,6 +1,7 @@
 mod config;
 mod commands;
 mod db;
+pub mod rate_limit;
 
 use clap::{Parser, Subcommand};
 use rusqlite::Connection;

@@ -1,7 +1,7 @@
-// src/commands/fetch.rs
-
 use crate::AppContext;
 use crate::db;
+use crate::rate_limit;
+use std::time::Duration;
 use tracing::{info, error, warn, debug};
 use wreq::Client;
 use wreq_util::Emulation;
@@ -36,79 +36,119 @@ pub async fn run(ctx: &AppContext, target_feed: Option<String>) {
     for feed in feeds_to_process {
         info!("Fetching feed: {} ({})", feed.name, feed.url);
         
-        match client.get(&feed.url).send().await {
-            Ok(response) => {
-                if !response.status().is_success() {
-                    error!("HTTP error {} for feed {}", response.status(), feed.name);
-                    continue;
+        let max_retries = 1;
+        let mut maybe_response = None;
+
+        for attempt in 0..=max_retries {
+            match client.get(&feed.url).send().await {
+                Ok(response) => {
+                    if response.status().as_u16() == 429 {
+                        let wait_secs = response.headers().get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(rate_limit::parse_retry_after_str)
+                            .unwrap_or(rate_limit::DEFAULT_SITE_TIMEOUT_SECS);
+
+                        if attempt < max_retries {
+                            rate_limit::sleep_with_reason(
+                                wait_secs,
+                                &format!("Feed '{}' hit rate limit (429). Attempt {}/{}", feed.name, attempt + 1, max_retries),
+                            ).await;
+                            continue;
+                        } else {
+                            warn!("Feed '{}' hit 429 rate limit after retry. Waiting timeout of {}s to avoid spamming server.", feed.name, wait_secs);
+                            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+                            break;
+                        }
+                    } else if !response.status().is_success() {
+                        error!("HTTP error {} for feed {}", response.status(), feed.name);
+                        break;
+                    } else {
+                        maybe_response = Some(response);
+                        break;
+                    }
                 }
-
-                let bytes = match response.bytes().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        error!("Failed to read bytes for feed {}: {}", feed.name, e);
-                        continue;
-                    }
-                };
-
-                // Парсинг XML вмісту
-                let parsed_feed = match feed_rs::parser::parse(&bytes[..]) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        error!("Failed to parse XML for feed {}: {}", feed.name, e);
-                        continue;
-                    }
-                };
-
-                if let Some(latest_entry) = parsed_feed.entries.first() {
-                    let latest_link = latest_entry.links.first().map(|l| l.href.as_str()).unwrap_or("");
-                    let current_hash = calculate_hash(latest_link);
-
-                    match db::get_feed_last_hash(ctx, &feed.name) {
-                        Ok(Some(saved_hash)) if saved_hash == current_hash => {
-                            info!("Feed '{}' has not changed since last check. Skipping details.", feed.name);
-                            continue; 
-                        }
-                        Ok(_) => {
-                            debug!("Feed '{}' has new content or checked first time.", feed.name);
-                        }
-                        Err(e) => {
-                            warn!("Failed to read feed state from DB for '{}': {}", feed.name, e);
-                        }
-                    }
-
-                    let mut inserted_count = 0;
-                    for entry in &parsed_feed.entries {
-                        let title = entry.title.as_ref().map(|t| t.content.as_str()).unwrap_or("No Title");
-                        let link = entry.links.first().map(|l| l.href.as_str()).unwrap_or("");
-                        
-                        let description_cleaned = entry.summary.as_ref()
-                            .map(|s| sanitize_html(&s.content));
-                        
-                        let pub_date = entry.updated.or(entry.published)
-                            .map(|dt| dt.to_rfc3339())
-                            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-
-                        match db::insert_raw_article(ctx, &feed.name, title, link, description_cleaned.as_deref(), &pub_date) {
-                            Ok(0) => debug!("Article already exists: {}", link), 
-                            Ok(_) => inserted_count += 1, 
-                            Err(e) => error!("Failed to save article to DB: {}", e),
-                        }
-                    }
-
-                    info!("Processed '{}'. Inserted {} new articles.", feed.name, inserted_count);
-
-                    if let Err(e) = db::update_feed_state(ctx, &feed.name, &current_hash) {
-                        error!("Failed to update feed state in DB for '{}': {}", feed.name, e);
-                    }
-                } else {
-                    warn!("Feed '{}' is empty.", feed.name);
+                Err(e) => {
+                    error!("Emulated HTTP request failed for feed {}: {}", feed.name, e);
+                    break;
                 }
-            }
-            Err(e) => {
-                error!("Emulated HTTP request failed for feed {}: {}", feed.name, e);
             }
         }
+
+        let response = match maybe_response {
+            Some(r) => r,
+            None => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+
+        let bytes = match response.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Failed to read bytes for feed {}: {}", feed.name, e);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+
+        // Парсинг XML вмісту
+        let parsed_feed = match feed_rs::parser::parse(&bytes[..]) {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Failed to parse XML for feed {}: {}", feed.name, e);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+
+        if let Some(latest_entry) = parsed_feed.entries.first() {
+            let latest_link = latest_entry.links.first().map(|l| l.href.as_str()).unwrap_or("");
+            let current_hash = calculate_hash(latest_link);
+
+            match db::get_feed_last_hash(ctx, &feed.name) {
+                Ok(Some(saved_hash)) if saved_hash == current_hash => {
+                    info!("Feed '{}' has not changed since last check. Skipping details.", feed.name);
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue; 
+                }
+                Ok(_) => {
+                    debug!("Feed '{}' has new content or checked first time.", feed.name);
+                }
+                Err(e) => {
+                    warn!("Failed to read feed state from DB for '{}': {}", feed.name, e);
+                }
+            }
+
+            let mut inserted_count = 0;
+            for entry in &parsed_feed.entries {
+                let title = entry.title.as_ref().map(|t| t.content.as_str()).unwrap_or("No Title");
+                let link = entry.links.first().map(|l| l.href.as_str()).unwrap_or("");
+                
+                let description_cleaned = entry.summary.as_ref()
+                    .map(|s| sanitize_html(&s.content));
+                
+                let pub_date = entry.updated.or(entry.published)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+                match db::insert_raw_article(ctx, &feed.name, title, link, description_cleaned.as_deref(), &pub_date) {
+                    Ok(0) => debug!("Article already exists: {}", link), 
+                    Ok(_) => inserted_count += 1, 
+                    Err(e) => error!("Failed to save article to DB: {}", e),
+                }
+            }
+
+            info!("Processed '{}'. Inserted {} new articles.", feed.name, inserted_count);
+
+            if let Err(e) = db::update_feed_state(ctx, &feed.name, &current_hash) {
+                error!("Failed to update feed state in DB for '{}': {}", feed.name, e);
+            }
+        } else {
+            warn!("Feed '{}' is empty.", feed.name);
+        }
+
+        // Polite delay between feeds to prevent spamming multi-feed hosts
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     info!("FETCH process completed successfully.");

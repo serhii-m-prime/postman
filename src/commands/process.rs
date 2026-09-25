@@ -2,7 +2,9 @@
 
 use crate::AppContext;
 use crate::db;
-use tracing::{info, error, warn, debug};
+use crate::rate_limit;
+use std::time::Duration;
+use tracing::{info, error, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -54,7 +56,7 @@ pub async fn run(ctx: &AppContext, target_article_id: Option<i32>) {
             if article.id != target_id { continue; }
         }
 
-        info!("Analyzing article [ID: {}]: {}", article.id, article.title);
+        info!("Analyzing article [ID: {} SOURCE: {}]: {}", article.id, article.feed_name, article.title);
 
         let article_context = format!(
             "FEED: {}\nTITLE: {}\nCONTEXT:\n{}",
@@ -80,8 +82,17 @@ pub async fn run(ctx: &AppContext, target_article_id: Option<i32>) {
             }
             Err(e) => {
                 error!("Gemini API failed for article {}: {}", article.id, e);
+                let err_msg = e.to_string();
+                if err_msg.contains("429") || err_msg.to_lowercase().contains("rate limit") {
+                    warn!("Gemini API rate limit (429) persists after retries. Pausing with 60s timeout and halting PROCESS stage to prevent server spam.");
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    break;
+                }
             }
         }
+
+        // Polite delay between articles to stay within Gemini RPM limits (e.g. 15 RPM for free tier)
+        tokio::time::sleep(Duration::from_millis(1500)).await;
     }
 
     info!("PROCESS stage completed.");
@@ -127,36 +138,64 @@ async fn call_gemini_api(
             }
         }
     });
-    
-    let response = client.post(&ctx.config.gemini_api_url)
-        .header("X-goog-api-key", api_key) // <-- Ключ тепер тут
-        .json(&payload)
-        .send()
-        .await?;
 
-    let status = response.status();
-    debug!("Gemini HTTP response status code received: {}", status);
+    let max_retries = rate_limit::MAX_RETRIES;
+    for attempt in 0..=max_retries {
+        let response = client.post(&ctx.config.gemini_api_url)
+            .header("X-goog-api-key", api_key)
+            .json(&payload)
+            .send()
+            .await?;
 
-    if !status.is_success() {
-        let err_body = response.text().await?;
-            
-        error!("=================== GEMINI RAW ERROR RESPONSE ===================");
-        error!("HTTP STATUS: {}", status);
-        error!("JSON BODY:\n{}", err_body);
-        error!("================================================================");
+        let status = response.status();
 
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err("Gemini API Rate Limit reached (429). Please slow down.".into());
+            let header_retry = response.headers().get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(rate_limit::parse_retry_after_str);
+
+            let err_body = response.text().await.unwrap_or_default();
+            let body_delay = rate_limit::parse_gemini_retry_delay(&err_body);
+
+            let wait_secs = header_retry
+                .or(body_delay)
+                .unwrap_or(rate_limit::DEFAULT_LLM_TIMEOUT_SECS);
+
+            if attempt < max_retries {
+                rate_limit::sleep_with_reason(
+                    wait_secs,
+                    &format!("Gemini API Rate Limit reached (429) during scoring. Attempt {}/{}", attempt + 1, max_retries),
+                ).await;
+                continue;
+            } else {
+                error!("=================== GEMINI RAW ERROR RESPONSE ===================");
+                error!("HTTP STATUS: {}", status);
+                error!("JSON BODY:\n{}", err_body);
+                error!("================================================================");
+                return Err("Gemini API Rate Limit reached (429). Please slow down.".into());
+            }
         }
-        return Err(format!("Gemini API failed with status {}. See raw body above.", status).into());
+
+        if !status.is_success() {
+            let err_body = response.text().await?;
+                
+            error!("=================== GEMINI RAW ERROR RESPONSE ===================");
+            error!("HTTP STATUS: {}", status);
+            error!("JSON BODY:\n{}", err_body);
+            error!("================================================================");
+
+            return Err(format!("Gemini API failed with status {}. See raw body above.", status).into());
+        }
+
+        let json_resp: serde_json::Value = response.json().await?;
+        
+        let raw_json_text = json_resp["candidates"][0]["content"]["parts"][0]["text"]
+            .as_str()
+            .ok_or("Failed to extract text from Gemini response structure")?;
+
+        let analysis: AiAnalysis = serde_json::from_str(raw_json_text)?;
+        return Ok(analysis);
     }
 
-    let json_resp: serde_json::Value = response.json().await?;
-    
-    let raw_json_text = json_resp["candidates"][0]["content"]["parts"][0]["text"]
-        .as_str()
-        .ok_or("Failed to extract text from Gemini response structure")?;
-
-    let analysis: AiAnalysis = serde_json::from_str(raw_json_text)?;
-    Ok(analysis)
+    Err("Gemini API scoring failed after retries".into())
 }
